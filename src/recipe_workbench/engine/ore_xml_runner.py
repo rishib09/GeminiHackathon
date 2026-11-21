@@ -94,8 +94,13 @@ def run_ore_app_trade(
     <ModelParameters/>
     <Engine>FdBlackScholesVanillaEngine</Engine>
     <EngineParameters>
-      <Parameter name="TimeGrid">100</Parameter>
+      <Parameter name="Scheme">Douglas</Parameter>
+      <Parameter name="TimeGridPerYear">100</Parameter>
       <Parameter name="XGrid">100</Parameter>
+      <Parameter name="DampingSteps">0</Parameter>
+      <Parameter name="TimeGridMinimumSize">20</Parameter>
+      <Parameter name="ExerciseTimeStepsPerYear">24</Parameter>
+      <Parameter name="SolverType">FD</Parameter>
     </EngineParameters>
   </Product>
 </PricingEngines>
