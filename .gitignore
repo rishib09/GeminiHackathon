@@ -1,0 +1,50 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C / SWIG extensions
+*.so
+*.pyd
+*.dll
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing & static analysis caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pytype/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Graphify AST cache & local ORE / runtime outputs
+graphify-out/cache/
+runs/
+ore_runs/
+.recipe_workbench/
+*.log
+
+# IDEs & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+{
+  "snapshot_id": "spy_2026-09-10_eod",
+  "source": "yfinance+fred (immutable gold snapshot)",
+  "symbol": "SPY",
+  "asof": "2026-09-10",
+  "granularity": "eod",
+  "spot": 560.0,
+  "risk_free_rate": 0.0485,
+  "dividend_yield": 0.0128,
+  "contract_count": 412,
+  "expiry_count": 6,
+  "created_at": "2026-09-10T16:00:00Z",
+  "sha256_chain": "021e7cec7cad633546ffcc0b22429be762d22c58b89b0528ee3820d1fd711f13"
+}

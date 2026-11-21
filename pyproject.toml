@@ -1,0 +1,39 @@
+[project]
+name = "recipe-workbench"
+version = "0.1.0"
+description = "Recipe Workbench v1: Native Notion UI + ORE Python + Graphify Knowledge Graph + Gemini"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "open-source-risk-engine",
+    "graphifyy",
+    "notion-client>=2.2.1",
+    "google-genai>=3.2.0",
+    "networkx>=3.2",
+    "pydantic>=2.7",
+    "python-dotenv>=1.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "pandas>=2.2",
+    "pyarrow>=16.0",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[project.scripts]
+recipe = "recipe_workbench.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/recipe_workbench"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
