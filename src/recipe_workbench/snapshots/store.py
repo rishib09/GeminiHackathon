@@ -7,12 +7,63 @@ import json
 import math
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple
 
 import pandas as pd
 from pydantic import BaseModel
 
 DEFAULT_SNAPSHOTS_DIR = Path("snapshots")
+
+FRED_TREASURY_SERIES: Dict[str, str] = {
+    "3M": "DGS3MO",
+    "2Y": "DGS2",
+    "5Y": "DGS5",
+    "10Y": "DGS10",
+    "30Y": "DGS30",
+}
+
+DEFAULT_FALLBACK_TREASURY_RATES: Dict[str, float] = {
+    "3M": 0.0485,
+    "2Y": 0.0410,
+    "5Y": 0.0415,
+    "10Y": 0.0428,
+    "30Y": 0.0455,
+}
+
+
+def fetch_treasury_rate(
+    tenor: str = "10Y",
+    allow_network: bool = True,
+    fallback_rate: Optional[float] = None,
+) -> Tuple[float, str]:
+    """Fetch latest US Treasury constant-maturity yield from FRED (e.g., 10Y -> DGS10).
+
+    Returns (rate_decimal, source_label). Falls back cleanly if offline.
+    """
+    key = tenor.upper().replace(" ", "")
+    series_id = FRED_TREASURY_SERIES.get(key, key if key.startswith("DGS") else "DGS10")
+    default_fb = fallback_rate if fallback_rate is not None else DEFAULT_FALLBACK_TREASURY_RATES.get(key, 0.0428)
+
+    if not allow_network:
+        return round(float(default_fb), 6), f"FRED:{series_id} (offline fallback {default_fb:.2%})"
+
+    try:
+        import requests
+
+        resp = requests.get(
+            f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}",
+            timeout=8,
+        )
+        resp.raise_for_status()
+        lines = [ln for ln in resp.text.strip().splitlines()[1:] if ln and not ln.endswith(".")]
+        if lines:
+            obs_date, val_str = lines[-1].split(",")[:2]
+            rate_val = round(float(val_str) / 100.0, 6)
+            return rate_val, f"FRED:{series_id} (live {obs_date})"
+    except Exception:
+        pass
+
+    return round(float(default_fb), 6), f"FRED:{series_id} (fallback {default_fb:.2%})"
 
 
 class OptionContractRow(BaseModel):
@@ -69,6 +120,23 @@ class LoadedSnapshot(BaseModel):
             target_strike = self.manifest.spot * (1.05 if option_type == "Put" else 0.95)
 
         return min(same_exp, key=lambda c: (abs(c.strike - target_strike), c.strike))
+
+    def with_rate_override(self, risk_free_rate: float, source_note: Optional[str] = None) -> "LoadedSnapshot":
+        """Return a shallow copy of this snapshot with an overridden risk-free rate."""
+        new_source = self.manifest.source
+        if source_note:
+            new_source = f"{self.manifest.source} | rate={source_note}"
+        new_manifest = self.manifest.model_copy(
+            update={
+                "risk_free_rate": round(float(risk_free_rate), 6),
+                "source": new_source,
+            }
+        )
+        return LoadedSnapshot(
+            manifest=new_manifest,
+            chain=self.chain,
+            directory=self.directory,
+        )
 
 
 def _norm_cdf(x: float) -> float:

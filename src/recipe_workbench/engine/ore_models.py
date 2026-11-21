@@ -98,10 +98,16 @@ def _build_vol_surface(
     mat = ORE.Matrix(len(strike_grid), len(expiries))
 
     by_exp_strike: Dict[Tuple[str, float], float] = {}
+    spot_val = float(snapshot.manifest.spot)
     for c in snapshot.chain:
         key = (c.expiry, float(c.strike))
-        if key not in by_exp_strike:
-            by_exp_strike[key] = float(c.implied_vol)
+        iv_clean = min(max(float(c.implied_vol), 0.05), 1.50)
+        # Prefer OTM quotes (Put for K < spot, Call for K >= spot) to avoid stale deep-ITM IV noise
+        is_otm = (c.option_type == "Put" and c.strike < spot_val) or (
+            c.option_type == "Call" and c.strike >= spot_val
+        )
+        if key not in by_exp_strike or is_otm:
+            by_exp_strike[key] = iv_clean
 
     for j, exp in enumerate(expiries):
         exp_points = sorted((s, iv) for (e, s), iv in by_exp_strike.items() if e == exp)
@@ -222,24 +228,58 @@ def price_single_in_process(
     spot_h, q_h, r_h = _build_handles(snapshot, asof_date, dc)
 
     opt = _build_option(contract, asof_date, conventions)
-    if model_key == "flat_vol":
-        atm_vol = _atm_vol_for_expiry(snapshot.chain, snapshot.manifest.spot, contract.expiry)
+    atm_vol = _atm_vol_for_expiry(snapshot.chain, snapshot.manifest.spot, contract.expiry)
+    has_delta = True
+
+    if model_key == "flat_vol" or model_key == "fd_bs":
         vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
         proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
         engine = ORE.FdBlackScholesVanillaEngine(proc, 100, 100)
         engine_name = "ORE.FdBlackScholesVanillaEngine"
         model_name = f"Flat Black-Scholes vol ({atm_vol:.1%})"
+    elif model_key == "term_structure":
+        curve = _build_vol_curve(snapshot, asof_date, cal, dc)
+        vol_h = ORE.BlackVolTermStructureHandle(curve)
+        proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
+        engine = ORE.FdBlackScholesVanillaEngine(proc, 100, 100)
+        engine_name = "ORE.FdBlackScholesVanillaEngine"
+        model_name = "Vol term structure (BlackVarianceCurve)"
+    elif model_key == "heston":
+        heston_model = _build_heston_model(snapshot, asof_date, spot_h, q_h, r_h)
+        engine = ORE.FdHestonVanillaEngine(heston_model, 60, 60, 25)
+        engine_name = "ORE.FdHestonVanillaEngine"
+        model_name = "Heston stochastic vol"
+    elif model_key == "binomial_crr":
+        vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
+        proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
+        engine = ORE.BinomialCRRVanillaEngine(proc, 200)
+        engine_name = "ORE.BinomialCRRVanillaEngine"
+        model_name = f"Binomial CRR tree ({atm_vol:.1%})"
+    elif model_key == "baw":
+        vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
+        proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
+        engine = ORE.BaroneAdesiWhaleyApproximationEngine(proc)
+        engine_name = "ORE.BaroneAdesiWhaleyApproximationEngine"
+        model_name = f"Barone-Adesi-Whaley ({atm_vol:.1%})"
+        has_delta = False
+    elif model_key == "bjerksund":
+        vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
+        proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
+        engine = ORE.BjerksundStenslandApproximationEngine(proc)
+        engine_name = "ORE.BjerksundStenslandApproximationEngine"
+        model_name = f"Bjerksund-Stensland ({atm_vol:.1%})"
+        has_delta = False
     else:
         surf = _build_vol_surface(snapshot, asof_date, cal, dc)
         vol_h = ORE.BlackVolTermStructureHandle(surf)
         proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, vol_h)
-        engine = ORE.FdBlackScholesVanillaEngine(proc, 100, 100, 0, ORE.FdmSchemeDesc.Douglas(), True)
+        engine = ORE.FdBlackScholesVanillaEngine(proc, 100, 100, 0, ORE.FdmSchemeDesc.Douglas(), True, atm_vol)
         engine_name = "ORE.FdBlackScholesVanillaEngine(localVol=True)"
         model_name = "Local vol surface"
 
     opt.setPricingEngine(engine)
     npv = round(float(opt.NPV()) * contract.quantity, 4)
-    delta = round(float(opt.delta()) * contract.quantity, 4)
+    delta = round(float(opt.delta()) * contract.quantity, 4) if has_delta else None
 
     return PriceResult(
         contract=contract,
@@ -270,6 +310,7 @@ def compare_volatility_models(
     snapshot: LoadedSnapshot,
     conventions: ConventionsSpec,
     graph_version: str,
+    selected_model_keys: Optional[List[str]] = None,
 ) -> ComparisonResult:
     asof_date = to_ore_date(snapshot.manifest.asof)
     ORE.Settings.instance().evaluationDate = asof_date
@@ -279,111 +320,131 @@ def compare_volatility_models(
 
     sample = _sample_chain_for_rmse(snapshot.chain, max_samples=18)
     atm_vol = _atm_vol_for_expiry(snapshot.chain, snapshot.manifest.spot, contract.expiry)
+    active_keys = set(selected_model_keys) if selected_model_keys else {
+        "flat_vol",
+        "term_structure",
+        "local_vol",
+        "heston",
+    }
+
+    raw_rows: List[ModelRow] = []
 
     # 1. Flat vol
-    t0 = time.perf_counter()
-    flat_vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
-    flat_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, flat_vol_h)
-    opt_flat = _build_option(contract, asof_date, conventions)
-    opt_flat.setPricingEngine(ORE.FdBlackScholesVanillaEngine(flat_proc, 80, 80))
-    flat_price = round(float(opt_flat.NPV()), 4)
-    flat_delta = round(float(opt_flat.delta()), 4)
-    flat_rmse = _compute_chain_rmse(
-        sample, asof_date, conventions, lambda: ORE.FdBlackScholesVanillaEngine(flat_proc, 40, 40)
-    )
-    flat_ms = round((time.perf_counter() - t0) * 1000, 1)
+    if "flat_vol" in active_keys:
+        t0 = time.perf_counter()
+        flat_vol_h = ORE.BlackVolTermStructureHandle(ORE.BlackConstantVol(asof_date, cal, atm_vol, dc))
+        flat_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, flat_vol_h)
+        opt_flat = _build_option(contract, asof_date, conventions)
+        opt_flat.setPricingEngine(ORE.FdBlackScholesVanillaEngine(flat_proc, 80, 80))
+        flat_price = round(float(opt_flat.NPV()), 4)
+        flat_delta = round(float(opt_flat.delta()), 4)
+        flat_rmse = _compute_chain_rmse(
+            sample, asof_date, conventions, lambda: ORE.FdBlackScholesVanillaEngine(flat_proc, 40, 40)
+        )
+        flat_ms = round((time.perf_counter() - t0) * 1000, 1)
+        raw_rows.append(
+            ModelRow(
+                model_id="FlatBlackScholesVol",
+                model_name=f"Flat vol ({atm_vol:.1%})",
+                engine_name="ORE.FdBlackScholesVanillaEngine",
+                price=flat_price,
+                delta=flat_delta,
+                chain_rmse=flat_rmse,
+                rank=0,
+                elapsed_ms=flat_ms,
+                notes="Constant ATM implied vol",
+            )
+        )
 
     # 2. Vol term structure
-    t1 = time.perf_counter()
-    curve = _build_vol_curve(snapshot, asof_date, cal, dc)
-    ts_vol_h = ORE.BlackVolTermStructureHandle(curve)
-    ts_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, ts_vol_h)
-    opt_ts = _build_option(contract, asof_date, conventions)
-    opt_ts.setPricingEngine(ORE.FdBlackScholesVanillaEngine(ts_proc, 80, 80))
-    ts_price = round(float(opt_ts.NPV()), 4)
-    ts_delta = round(float(opt_ts.delta()), 4)
-    ts_rmse = _compute_chain_rmse(
-        sample, asof_date, conventions, lambda: ORE.FdBlackScholesVanillaEngine(ts_proc, 40, 40)
-    )
-    ts_ms = round((time.perf_counter() - t1) * 1000, 1)
+    if "term_structure" in active_keys:
+        t1 = time.perf_counter()
+        curve = _build_vol_curve(snapshot, asof_date, cal, dc)
+        ts_vol_h = ORE.BlackVolTermStructureHandle(curve)
+        ts_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, ts_vol_h)
+        opt_ts = _build_option(contract, asof_date, conventions)
+        opt_ts.setPricingEngine(ORE.FdBlackScholesVanillaEngine(ts_proc, 80, 80))
+        ts_price = round(float(opt_ts.NPV()), 4)
+        ts_delta = round(float(opt_ts.delta()), 4)
+        ts_rmse = _compute_chain_rmse(
+            sample, asof_date, conventions, lambda: ORE.FdBlackScholesVanillaEngine(ts_proc, 40, 40)
+        )
+        ts_ms = round((time.perf_counter() - t1) * 1000, 1)
+        raw_rows.append(
+            ModelRow(
+                model_id="VolTermStructure",
+                model_name="Term structure",
+                engine_name="ORE.FdBlackScholesVanillaEngine",
+                price=ts_price,
+                delta=ts_delta,
+                chain_rmse=ts_rmse,
+                rank=0,
+                elapsed_ms=ts_ms,
+                notes="ORE.BlackVarianceCurve by expiry",
+            )
+        )
 
     # 3. Local vol surface
-    t2 = time.perf_counter()
-    surf = _build_vol_surface(snapshot, asof_date, cal, dc)
-    lv_vol_h = ORE.BlackVolTermStructureHandle(surf)
-    lv_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, lv_vol_h)
-    opt_lv = _build_option(contract, asof_date, conventions)
-    opt_lv.setPricingEngine(
-        ORE.FdBlackScholesVanillaEngine(lv_proc, 80, 80, 0, ORE.FdmSchemeDesc.Douglas(), True, atm_vol)
-    )
-    lv_price = round(float(opt_lv.NPV()), 4)
-    lv_delta = round(float(opt_lv.delta()), 4)
-    lv_rmse = _compute_chain_rmse(
-        sample,
-        asof_date,
-        conventions,
-        lambda: ORE.FdBlackScholesVanillaEngine(lv_proc, 40, 40, 0, ORE.FdmSchemeDesc.Douglas(), True, atm_vol),
-    )
-    lv_ms = round((time.perf_counter() - t2) * 1000, 1)
+    if "local_vol" in active_keys:
+        t2 = time.perf_counter()
+        surf = _build_vol_surface(snapshot, asof_date, cal, dc)
+        lv_vol_h = ORE.BlackVolTermStructureHandle(surf)
+        lv_proc = ORE.BlackScholesMertonProcess(spot_h, q_h, r_h, lv_vol_h)
+        opt_lv = _build_option(contract, asof_date, conventions)
+        opt_lv.setPricingEngine(
+            ORE.FdBlackScholesVanillaEngine(lv_proc, 80, 80, 0, ORE.FdmSchemeDesc.Douglas(), True, atm_vol)
+        )
+        lv_price = round(float(opt_lv.NPV()), 4)
+        lv_delta = round(float(opt_lv.delta()), 4)
+        lv_rmse = _compute_chain_rmse(
+            sample,
+            asof_date,
+            conventions,
+            lambda: ORE.FdBlackScholesVanillaEngine(lv_proc, 40, 40, 0, ORE.FdmSchemeDesc.Douglas(), True, atm_vol),
+        )
+        lv_ms = round((time.perf_counter() - t2) * 1000, 1)
+        raw_rows.append(
+            ModelRow(
+                model_id="LocalVolSurface",
+                model_name="Local vol",
+                engine_name="ORE.FdBlackScholesVanillaEngine(localVol=True)",
+                price=lv_price,
+                delta=lv_delta,
+                chain_rmse=lv_rmse,
+                rank=0,
+                elapsed_ms=lv_ms,
+                notes="ORE.BlackVarianceSurface Dupire PDE",
+            )
+        )
 
     # 4. Heston stochastic vol
-    t3 = time.perf_counter()
-    heston_model = _build_heston_model(snapshot, asof_date, spot_h, q_h, r_h)
-    opt_heston = _build_option(contract, asof_date, conventions)
-    opt_heston.setPricingEngine(ORE.FdHestonVanillaEngine(heston_model, 50, 50, 25))
-    heston_price = round(float(opt_heston.NPV()), 4)
-    heston_delta = round(float(opt_heston.delta()), 4)
-    heston_rmse = _compute_chain_rmse(
-        sample, asof_date, conventions, lambda: ORE.FdHestonVanillaEngine(heston_model, 25, 30, 15)
-    )
-    heston_ms = round((time.perf_counter() - t3) * 1000, 1)
+    if "heston" in active_keys:
+        t3 = time.perf_counter()
+        heston_model = _build_heston_model(snapshot, asof_date, spot_h, q_h, r_h)
+        opt_heston = _build_option(contract, asof_date, conventions)
+        opt_heston.setPricingEngine(ORE.FdHestonVanillaEngine(heston_model, 50, 50, 25))
+        heston_price = round(float(opt_heston.NPV()), 4)
+        heston_delta = round(float(opt_heston.delta()), 4)
+        heston_rmse = _compute_chain_rmse(
+            sample, asof_date, conventions, lambda: ORE.FdHestonVanillaEngine(heston_model, 25, 30, 15)
+        )
+        heston_ms = round((time.perf_counter() - t3) * 1000, 1)
+        raw_rows.append(
+            ModelRow(
+                model_id="HestonStochasticVol",
+                model_name="Heston",
+                engine_name="ORE.FdHestonVanillaEngine",
+                price=heston_price,
+                delta=heston_delta,
+                chain_rmse=heston_rmse,
+                rank=0,
+                elapsed_ms=heston_ms,
+                notes="2D FD stochastic vol PDE",
+            )
+        )
 
-    raw_rows = [
-        ModelRow(
-            model_id="FlatBlackScholesVol",
-            model_name=f"Flat vol ({atm_vol:.1%})",
-            engine_name="ORE.FdBlackScholesVanillaEngine",
-            price=flat_price,
-            delta=flat_delta,
-            chain_rmse=flat_rmse,
-            rank=0,
-            elapsed_ms=flat_ms,
-            notes="Constant ATM implied vol",
-        ),
-        ModelRow(
-            model_id="VolTermStructure",
-            model_name="Term structure",
-            engine_name="ORE.FdBlackScholesVanillaEngine",
-            price=ts_price,
-            delta=ts_delta,
-            chain_rmse=ts_rmse,
-            rank=0,
-            elapsed_ms=ts_ms,
-            notes="ORE.BlackVarianceCurve by expiry",
-        ),
-        ModelRow(
-            model_id="LocalVolSurface",
-            model_name="Local vol",
-            engine_name="ORE.FdBlackScholesVanillaEngine(localVol=True)",
-            price=lv_price,
-            delta=lv_delta,
-            chain_rmse=lv_rmse,
-            rank=0,
-            elapsed_ms=lv_ms,
-            notes="ORE.BlackVarianceSurface Dupire PDE",
-        ),
-        ModelRow(
-            model_id="HestonStochasticVol",
-            model_name="Heston",
-            engine_name="ORE.FdHestonVanillaEngine",
-            price=heston_price,
-            delta=heston_delta,
-            chain_rmse=heston_rmse,
-            rank=0,
-            elapsed_ms=heston_ms,
-            notes="2D FD stochastic vol PDE",
-        ),
-    ]
+    if not raw_rows:
+        return compare_volatility_models(contract, snapshot, conventions, graph_version, selected_model_keys=None)
 
     sorted_indices = sorted(range(len(raw_rows)), key=lambda idx: raw_rows[idx].chain_rmse)
     for rank_idx, row_idx in enumerate(sorted_indices, start=1):

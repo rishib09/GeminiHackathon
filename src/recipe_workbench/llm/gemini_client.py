@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import List, Optional, Type, TypeVar
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel, Field
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=BaseModel)
 
 
@@ -80,5 +82,6 @@ def call_structured(
         if not interaction.output_text:
             return None
         return schema_cls.model_validate_json(interaction.output_text)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Gemini call_structured(%s) failed: %s", schema_cls.__name__, exc)
         return None

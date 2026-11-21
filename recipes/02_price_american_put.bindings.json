@@ -1,0 +1,7 @@
+{
+  "bindings": {},
+  "disambiguations": {
+    "american_put": "ore_trade"
+  },
+  "slug": "02_price_american_put"
+}

@@ -14,7 +14,8 @@ This document provides a comprehensive technical overview of the **Recipe Workbe
 | **`compiler`** | `Complete` | `parser.py`<br>`linter.py`<br>`binder.py`<br>`sidecar.py` | `parse_recipe_file()`<br>`lint_recipe()`<br>`compile_recipe()`<br>`SidecarData`<br>`CompiledRecipe` | Parses canonical Markdown titles and front-matter, validates syntax against graph rules, binds prose phrases to scope nodes, and manages sidecar files (`.bindings.json`). |
 | **`llm`** | `Complete` | `gemini_client.py` | `call_structured()`<br>`BindingProposalBatch`<br>`RootPrefillProposal`<br>`ExplainerDraft` | Interfaces with Google Gemini via Interactions API; proposes structured binding fallbacks and drafts grounded explainers when API keys are available. |
 | **`explainer`** | `Complete` | `generator.py` | `generate_explainer()`<br>`ExplainerDocument`<br>`GroundedSentence`<br>`verify_grounding()` | Synthesizes a 5-layer pedagogical document (Business, Quant, Architecture Mermaid, Object Drilldown, Verified Code) with rigorous graph-path grounding. |
-| **`notion_ui`** | `Complete` | `blocks.py`<br>`sync.py` | `build_hub_blocks()`<br>`build_recipe_page_blocks()`<br>`build_explainer_blocks()`<br>`sync_recipe_to_notion()` | Implements the Notion block tree for all 3 screens (Recipe Hub, Active Recipe with colored annotations, and 5-layer Explainer) with live sync. |
+| **`notion_ui`** | `Deprecated` | `blocks.py`<br>`sync.py` | `build_hub_blocks()`<br>`build_recipe_page_blocks()`<br>`build_explainer_blocks()`<br>`sync_recipe_to_notion()` | Legacy Notion block sync prototype. **Superseded** by custom dynamic web pages (see Section 6: Why Notion Won't Work). |
+| **`api` & `web`** | `Active` | `api/server.py`<br>`web/` | `/api/analyze`, `/api/compile`<br>`/api/picker/*`, `/api/scope` | FastAPI + React/Vite dynamic quant recipe workspace: live keystroke keyword detection, interactive disambiguation, and dynamic recipe page generation. |
 | **`corpus`** | `Complete` | `ore_corpus/` | `ore_swig_manifest.py`<br>`oreapp.hpp`<br>`market.hpp`<br>`equityoption.hpp` | C++ ORE headers and Python SWIG bindings corpus feeding Graphify AST extraction into `graphify-out/graph.json`. |
 
 ---
@@ -374,3 +375,46 @@ sequenceDiagram
 
 3. **5-Layer Grounded Explainability**:
    - Explainer documents avoid hallucination through the `verify_sentence_grounding()` engine, which maps technical claims directly to shortest graph paths between ORE code entities and financial concepts.
+
+---
+
+## 6. Architectural Decision: Why Notion Won't Work (Pivot to Dynamic Quant Recipe Pages)
+
+> **Decision:** Do **not** build the primary Recipe Workbench UI on top of Notion. Build a **custom dynamic web workspace** (`api/server.py` + `web/`) that renders live, interactive pages for creating and executing quant recipes.
+
+### Why Notion Does Not Fit
+1. **No Real-Time Keystroke / Inline Span Interaction**: Notion's API is poll-based with rate limits and 2,000-character block chunking. It cannot support sub-50ms keystroke-level ORE keyword highlighting, live margin diagnostics, or hover/click inspection on bound quant spans.
+2. **Static Block Model vs. Dynamic Recipe Pages**: Notion pages are static document trees. What we actually need are **dynamic pages that construct and mutate quant recipes on the fly**—where choosing a root, resolving an ambiguity (e.g., *ORE In-Process Instrument* vs. *OREApp XML Trade*), or toggling models/calculators immediately rebuilds the scope rail, mounts interactive parameter controls, and re-runs ORE pricing/comparisons inline.
+3. **No Custom Interactive Quant Widgets**: Notion cannot host live inline disambiguation modals, interactive volatility-surface/RMSE comparison tables, calculator pickers, or side-by-side 5-layer explainers bound directly to the `ScopeSpec` graph.
+4. **Sync Fragility & Latency**: Polling Notion blocks, diffing user prose edits against generated result blocks, and rewriting pages introduces multi-second latency and race conditions that break the interactive quant authoring loop.
+
+### Target UX: Dynamic Quant Recipe Pages
+- **Single Dynamic Canvas**: Users type natural language or use the guided Root → Verb → Axis picker, and the page dynamically assembles itself into an executable quant recipe.
+- **Live Scope Rail & Inline Controls**: As prose is edited, deterministic keyword detection (`/api/analyze`) highlights instruments, models, inputs, and calculators in real time, surfacing ambiguity cards and dynamic parameter pills directly in the page.
+- **Live ORE Execution & Grounded Explainers**: Compiling (`/api/compile`) executes ORE/QuantLib deterministically and streams structured results (NPV, Greeks, 4-model RMSE comparison tables, provenance hashes, and 5-layer grounded explainers) directly into reactive UI components.
+
+---
+
+## 7. LLM Integration Points & Model Sizing Strategy
+
+### Where the LLM Integrates (and Where It Does Not)
+
+| Pipeline Stage | LLM Role | Current Status |
+| :--- | :--- | :--- |
+| **1. Prompt → Dynamic Recipe Scaffold** | Turn a natural-language quant goal into a structured `RootPrefillProposal` (root, verb, axis, initial contract & calculator widgets) constrained to `OREDomainGraph`. | Schema defined (`RootPrefillProposal` in `llm/gemini_client.py`); ready to wire into `api/server.py`. |
+| **2. Fuzzy Prose-to-Graph Binding** | Fallback when deterministic alias/regex matching misses paraphrased quant concepts (`BindingProposalBatch`). Proposals are marked `proposed=True` for user confirmation. | Implemented in `compiler/binder.py` (`_propose_llm_bindings`); currently disabled in `api/server.py` (`use_llm_fallback=False`). |
+| **3. 5-Layer Grounded Explainer Synthesis** | Drafts Business Intuition, Technical Intuition, Architecture Map, and Object Drilldown (`ExplainerDraft`), then every sentence is verified against graph shortest paths (`verify_sentence_grounding`). | Implemented in `explainer/generator.py`. |
+| **4. Interactive Recipe Refinement** | Conversational edits to an existing dynamic recipe page (e.g., *"switch to 60D OTM calls and compare pricing engines"*). | Planned for dynamic web UI. |
+| **Keystroke Analysis & Quant Pricing** | **NO LLM.** Keystroke span detection (`/api/analyze`), scope walking, ORE/QuantLib pricing, RMSE ranking, and SHA-256 provenance remain 100% deterministic. | Enforced by design. |
+
+### How Powerful Should the Model Be?
+Because the ORE Knowledge Graph (`ScopeSpec`) strictly bounds the valid vocabulary and ORE/QuantLib performs all numerical computation, **a tiered model strategy** is optimal:
+
+1. **Fast / Lightweight Structured-Output Model (Default — ~85–90% of calls)**
+   - **Use for:** `RootPrefillProposal`, `BindingProposalBatch`, parameter extraction, and dynamic page widget scaffolding.
+   - **Why:** These are tightly constrained JSON classification/extraction tasks over a small node list (`ScopeSpec`). Low latency (<1s) and strict JSON schema adherence matter far more than deep reasoning.
+   - **Current default:** `gemini-4-hydrogen` (fast Flash-tier class) in `llm/gemini_client.py`.
+
+2. **Stronger Pro / Reasoning-Tier Model (On-Demand — ~10–15% of calls)**
+   - **Use for:** Complex multi-step quant recipe generation from underspecified prompts, and rich 5-layer `ExplainerDraft` technical narratives interpreting model calibration differences (e.g., Local Vol vs. Heston RMSE trade-offs and ORE C++ architecture).
+   - **Why:** Better quantitative finance intuition and cleaner prose, while still strictly post-checked by `verify_sentence_grounding()` so it cannot hallucinate ORE classes or numbers.

@@ -23,6 +23,8 @@ class SidecarData(BaseModel):
     slug: str
     bindings: Dict[str, ConfirmedBinding] = Field(default_factory=dict)
     disambiguations: Dict[str, str] = Field(default_factory=dict)
+    selected_models: List[str] = Field(default_factory=list)
+    selected_calculators: List[str] = Field(default_factory=list)
 
     def get_by_phrase(self, phrase: str) -> Optional[ConfirmedBinding]:
         h = hash_span(phrase)

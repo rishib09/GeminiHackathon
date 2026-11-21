@@ -21,6 +21,12 @@ from recipe_workbench.engine.schemas import (
     PriceResult,
 )
 from recipe_workbench.graph.domain_graph import OREDomainGraph
+from recipe_workbench.graph.keyword_detector import (
+    KeywordAnalysisResult,
+    KeywordCategory,
+    analyze_ore_keywords,
+    detect_spans_in_text,
+)
 from recipe_workbench.graph.picker import RootPicker
 from recipe_workbench.graph.schema import Axis, ScopeSpec, Verb
 from recipe_workbench.graph.scope_walker import compute_scope
@@ -41,6 +47,7 @@ class BoundSpan(BaseModel):
         "llm_proposed",
         "result_ref",
     ]
+    category: Optional[KeywordCategory] = None
     proposed: bool = False
 
 
@@ -85,6 +92,7 @@ class CompiledRecipe(BaseModel):
     comparison_result: Optional[ComparisonResult] = None
     price_result: Optional[PriceResult] = None
     llm_proposals: List[str] = Field(default_factory=list)
+    keyword_analysis: Optional[KeywordAnalysisResult] = None
 
 
 def _find_non_overlapping_spans(
@@ -219,6 +227,60 @@ def _propose_llm_bindings(
     return proposed
 
 
+def _infer_span_category(target_id: str, graph: OREDomainGraph) -> KeywordCategory:
+    if target_id.startswith(("literal:", "param:")):
+        return "input_param"
+    if target_id.startswith("contract:"):
+        return "instrument"
+    if target_id.startswith("model:"):
+        return "model"
+    node = graph.get_node(target_id)
+    if node is None:
+        return "input_param"
+    if node.category.value == "root" or node.id == "OREInProcessInstrument":
+        return "instrument"
+    if node.category.value == "varies":
+        return "engine" if node.axis == Axis.PRICING_ENGINE.value else "model"
+    if node.category.value == "formula":
+        return "calculator"
+    if node.category.value == "sibling":
+        return "adjacent_ore"
+    if node.id in {"ORETradeXML", "PricingEngineRouter"}:
+        return "engine"
+    return "input_param"
+
+
+def _merge_keyword_spans(
+    text: str,
+    existing_spans: List[BoundSpan],
+    graph: OREDomainGraph,
+) -> List[BoundSpan]:
+    """Ensure every ORE framework keyword detected in text has a typed, separated span."""
+    for sp in existing_spans:
+        if sp.category is None:
+            sp.category = _infer_span_category(sp.target_id, graph)
+
+    occupied = [(sp.start, sp.end) for sp in existing_spans]
+    merged = list(existing_spans)
+    for kw in detect_spans_in_text(text, graph):
+        if any(not (kw.end <= os_ or kw.start >= oe) for os_, oe in occupied):
+            continue
+        occupied.append((kw.start, kw.end))
+        merged.append(
+            BoundSpan(
+                start=kw.start,
+                end=kw.end,
+                phrase=kw.phrase,
+                target_id=kw.node_id,
+                source="literal" if kw.category == "input_param" else "scope_match",
+                category=kw.category,
+                proposed=False,
+            )
+        )
+    merged.sort(key=lambda sp: sp.start)
+    return merged
+
+
 def compile_recipe(
     recipe: ParsedRecipe,
     graph: OREDomainGraph,
@@ -229,9 +291,45 @@ def compile_recipe(
     use_llm_fallback: bool = True,
 ) -> CompiledRecipe:
     picker = RootPicker(graph)
-    root_id, verb, axis = picker.parse_title(recipe.title_line)
     sc = sidecar or load_sidecar(recipe.path)
     disambig = sc.disambiguations.get("american_put")
+
+    full_text = "\n".join([recipe.title_line.lstrip("#").strip(), *(p.text for p in recipe.paragraphs)])
+    keyword_analysis = analyze_ore_keywords(
+        full_text,
+        graph,
+        selected_models=sc.selected_models or None,
+        selected_calculators=sc.selected_calculators or None,
+    )
+
+    is_freeform = False
+    try:
+        root_id, verb, axis = picker.parse_title(recipe.title_line)
+    except ValueError:
+        is_freeform = True
+        root_id = "EquityOption"
+        verb = keyword_analysis.inferred_verb
+        axis = keyword_analysis.inferred_axis
+        if verb == Verb.EXPLAIN:
+            verb = Verb.PRICE
+
+    # Allow user-checked calculator in Notion to override the active verb/axis
+    active_calcs = [c.id for c in keyword_analysis.recommended_calculators if c.selected]
+    active_models = [m.id for m in keyword_analysis.recommended_models if m.selected]
+    if sc.selected_calculators:
+        if "compare_pricing_engines" in active_calcs:
+            verb = Verb.COMPARE
+            axis = Axis.PRICING_ENGINE.value
+        elif "compare_vol_models" in active_calcs:
+            verb = Verb.COMPARE
+            axis = Axis.VOLATILITY_MODEL.value
+        elif "price_ore_app" in active_calcs:
+            verb = Verb.PRICE
+            axis = None
+            disambig = "ore_trade"
+        elif "price_single" in active_calcs:
+            verb = Verb.PRICE
+            axis = None
 
     scope = compute_scope(
         graph=graph,
@@ -301,9 +399,12 @@ def compile_recipe(
                 dynamic_aliases.append((b.phrase, b.target_id, "sidecar"))
 
         spans = _find_non_overlapping_spans(para.text, dynamic_aliases)
+        spans = _merge_keyword_spans(para.text, spans, graph)
         if use_llm_fallback:
             extra_llm = _propose_llm_bindings(para.text, spans, scope)
             if extra_llm:
+                for sp in extra_llm:
+                    sp.category = _infer_span_category(sp.target_id, graph)
                 spans.extend(extra_llm)
                 spans.sort(key=lambda sp: sp.start)
                 llm_proposals.extend(f"{sp.phrase} -> {sp.target_id}" for sp in extra_llm)
@@ -317,9 +418,10 @@ def compile_recipe(
 
         lower = para.text.lower()
 
-        # Check ambiguity on "American put" if not resolved in sidecar (FR-15)
+        # Check ambiguity on "American put" if not resolved in sidecar (FR-15),
+        # unless user already explicitly chose a calculator/model in freeform mode
         amb_match = re.search(r"\bamerican\s+put\b", para.text, re.IGNORECASE)
-        if amb_match and disambig is None:
+        if amb_match and disambig is None and not is_freeform and not sc.selected_calculators:
             ann.ambiguity = _build_ambiguity_prompt(amb_match.group(0))
             halted = True
             annotations.append(ann)
@@ -335,7 +437,9 @@ def compile_recipe(
             defined_names[def_name] = f"contract:{defined_contract.contract_symbol}"
             # Re-run spans so `def_name` is highlighted as a definition binding
             dynamic_aliases.append((def_name, f"contract:{defined_contract.contract_symbol}", "definition"))
-            ann.spans = _find_non_overlapping_spans(para.text, dynamic_aliases)
+            ann.spans = _merge_keyword_spans(
+                para.text, _find_non_overlapping_spans(para.text, dynamic_aliases), graph
+            )
             ann.margin_ok.append(f"{defined_contract.exercise_style}Option ✓")
             ann.provenance_notes.append(
                 f"{defined_contract.contract_symbol} · strike {defined_contract.strike:.2f} · exp {defined_contract.expiry}"
@@ -352,18 +456,20 @@ def compile_recipe(
 
         # Ensure a default contract if user writes "Price ..." directly without a separate Define sentence
         active_contract = defined_contract or _extract_contract_from_sentence(
-            para.text if ("put" in lower or "call" in lower) else "30-day ATM American put",
+            para.text if ("put" in lower or "call" in lower) else full_text,
             snapshot,
             default_style=recipe.conventions.exercise_style,
         )
 
         # Execute formulas depending on verb & bound formula spans
         bound_ids = {sp.target_id for sp in ann.spans}
+        is_last_para = para.index == len(recipe.paragraphs) - 1
 
         if verb == Verb.COMPARE and (
             "formula_price" in bound_ids
             or "shown below" in lower
             or any(n.id in bound_ids for n in scope.varies)
+            or (is_freeform and is_last_para and comparison_res is None)
         ):
             if axis == Axis.PRICING_ENGINE.value:
                 comparison_res = compare_pricing_engines(
@@ -371,7 +477,11 @@ def compile_recipe(
                 )
             else:
                 comparison_res = compare_volatility_models(
-                    active_contract, snapshot, recipe.conventions, scope.graph_version
+                    active_contract,
+                    snapshot,
+                    recipe.conventions,
+                    scope.graph_version,
+                    selected_model_keys=active_models or None,
                 )
             ann.comparison_result = comparison_res
             ann.inline_result_pill = "shown below"
@@ -383,8 +493,9 @@ def compile_recipe(
             "formula_price" in bound_ids
             or "formula_cashflows" in bound_ids
             or "price" in lower
+            or (is_freeform and is_last_para and price_res is None)
         ):
-            if disambig == "ore_trade":
+            if disambig == "ore_trade" or "price_ore_app" in active_calcs:
                 price_res = run_ore_app_trade(
                     active_contract,
                     snapshot,
@@ -393,11 +504,13 @@ def compile_recipe(
                     run_dir=ore_run_dir,
                 )
             else:
+                chosen_model = active_models[0] if active_models else "local_vol"
                 price_res = price_single_in_process(
                     active_contract,
                     snapshot,
                     recipe.conventions,
                     scope.graph_version,
+                    model_key=chosen_model,
                 )
             ann.price_result = price_res
             ann.inline_result_pill = f"NPV {price_res.npv:.2f} USD"
@@ -415,7 +528,9 @@ def compile_recipe(
             working_model = comparison_res.winner_model_name
             defined_names[winner_alias] = f"model:{comparison_res.winner_model_id}"
             dynamic_aliases.append((winner_alias, f"model:{comparison_res.winner_model_id}", "result_ref"))
-            ann.spans = _find_non_overlapping_spans(para.text, dynamic_aliases)
+            ann.spans = _merge_keyword_spans(
+                para.text, _find_non_overlapping_spans(para.text, dynamic_aliases), graph
+            )
             ann.margin_ok.append(f"{winner_alias} → {working_model}")
             ann.provenance_notes.append("recomputes when the snapshot changes")
 
@@ -436,4 +551,5 @@ def compile_recipe(
         comparison_result=comparison_res,
         price_result=price_res,
         llm_proposals=llm_proposals,
+        keyword_analysis=keyword_analysis,
     )

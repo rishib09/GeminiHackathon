@@ -1,0 +1,11 @@
+{
+  "hub_page_id": "41fb38fc-cfe1-8120-a7f4-eac61fd6f7e8",
+  "hub_url": "https://app.notion.com/p/Recipe-Workbench-ORE-Quant-Lab-41fb38fccfe18120a7f4eac61fd6f7e8",
+  "database_id": "41fb38fc-cfe1-8170-9ab7-dbd438f0268e",
+  "pages": {
+    "recipes\\01_compare_vol_models.md": "41fb38fc-cfe1-8185-aaf1-db6538ba0d6d",
+    "recipes\\02_price_american_put.md": "41fb38fc-cfe1-8161-a53d-dbb6dd1b1485",
+    "recipes\\03_explain_american_option.md": "41fb38fc-cfe1-814b-ad98-eb0fde08ef23",
+    "recipes\\04_ore_keyword_sandbox.md": "41fb38fc-cfe1-81f2-aab0-cb052bf1e308"
+  }
+}

@@ -43,6 +43,11 @@ ore_runs/
 .recipe_workbench/
 *.log
 
+# Frontend build & Vite cache
+web/node_modules/
+web/dist/
+web/.vite-cache/
+
 # IDEs & OS files
 .vscode/
 .idea/

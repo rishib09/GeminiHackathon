@@ -1,0 +1,14 @@
+{
+  "snapshot_id": "spy_2026-11-21_eod",
+  "source": "yfinance+fred",
+  "symbol": "SPY",
+  "asof": "2026-11-21",
+  "granularity": "eod",
+  "spot": 689.81,
+  "risk_free_rate": 0.0434,
+  "dividend_yield": 0.01,
+  "contract_count": 2040,
+  "expiry_count": 6,
+  "created_at": "2026-11-21T21:36:28.496960+00:00",
+  "sha256_chain": "becc55fce75944d8d4e509ca11df3dc861e57dd1b856cf964dc41e05035a51c5"
+}

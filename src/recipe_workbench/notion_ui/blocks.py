@@ -8,6 +8,11 @@ import yaml
 
 from recipe_workbench.compiler.binder import CompiledRecipe, ParagraphAnnotation
 from recipe_workbench.explainer.generator import ExplainerDocument
+from recipe_workbench.graph.keyword_detector import (
+    CATEGORY_META,
+    KeywordAnalysisResult,
+    KeywordCategory,
+)
 from recipe_workbench.graph.schema import CandidateHit, ScopeSpec
 
 
@@ -132,14 +137,23 @@ def notion_table(headers: List[str], rows: List[List[List[Dict[str, Any]]]]) -> 
     }
 
 
+def _span_color(category: Optional[KeywordCategory], proposed: bool) -> str:
+    if proposed:
+        return "orange"
+    if category and category in CATEGORY_META:
+        return CATEGORY_META[category][2]
+    return "green"
+
+
 def render_annotated_paragraph_rich_text(ann: ParagraphAnnotation) -> List[Dict[str, Any]]:
     segments: List[Dict[str, Any]] = []
     cursor = 0
     for sp in sorted(ann.spans, key=lambda x: x.start):
         if sp.start > cursor:
             segments.extend(rt(ann.text[cursor : sp.start]))
-        color = "orange" if sp.proposed else "green"
-        segments.extend(rt(ann.text[sp.start : sp.end], bold=True, underline=True, color=color))
+        color = _span_color(sp.category, sp.proposed)
+        # Render each detected ORE input keyword as a distinct, color-coded pill chip
+        segments.extend(rt(ann.text[sp.start : sp.end], bold=True, code=True, color=color))
         cursor = sp.end
     if cursor < len(ann.text):
         segments.extend(rt(ann.text[cursor:]))
@@ -148,6 +162,93 @@ def render_annotated_paragraph_rich_text(ann: ParagraphAnnotation) -> List[Dict[
         segments.extend(rt("  "))
         segments.extend(rt(f"▸ {ann.inline_result_pill}", bold=True, code=True, color="green"))
     return segments
+
+
+def _build_separated_keywords_blocks(analysis: KeywordAnalysisResult) -> List[Dict[str, Any]]:
+    """Render every detected ORE input keyword as a visually separate, color-coded chip + mapping table."""
+    if not analysis.keywords:
+        return [
+            callout(
+                rt("No ORE framework keywords detected yet. ", bold=True)
+                + rt("Try typing terms like SPY, 30-day, ATM, American put, Heston, Local Vol, Binomial CRR, delta, or NPV.", color="gray"),
+                emoji="🔎",
+                color="gray_background",
+            )
+        ]
+
+    blocks: List[Dict[str, Any]] = [
+        heading(3, f"🏷️ Detected ORE Input Keywords ({len(analysis.keywords)} separated)"),
+    ]
+
+    ordered_cats: List[KeywordCategory] = [
+        "instrument",
+        "input_param",
+        "model",
+        "engine",
+        "calculator",
+        "adjacent_ore",
+    ]
+    for cat in ordered_cats:
+        kws = analysis.by_category.get(cat, [])
+        if not kws:
+            continue
+        label, emoji, color = CATEGORY_META[cat]
+        line_rt: List[Dict[str, Any]] = rt(f"{emoji} {label}:  ", bold=True, color=color)
+        for idx, kw in enumerate(kws):
+            if idx > 0:
+                line_rt.extend(rt("   "))
+            chip_text = f" {kw.phrase} "
+            line_rt.extend(rt(chip_text, bold=True, code=True, color=color))
+        blocks.append(paragraph(line_rt))
+
+    # Collapsible detailed mapping table: Keyword -> Category -> ORE Object -> Value
+    table_rows: List[List[List[Dict[str, Any]]]] = []
+    for kw in analysis.keywords:
+        label, emoji, color = CATEGORY_META[kw.category]
+        table_rows.append(
+            [
+                rt(kw.phrase, bold=True, code=True, color=color),
+                rt(f"{emoji} {label}", bold=True, color=color),
+                rt(kw.ore_ref, code=True),
+                rt(kw.resolved_value or kw.canonical, color="gray"),
+            ]
+        )
+    blocks.append(
+        toggle(
+            rt("📋 Keyword → ORE Framework Mapping Table", bold=True, color="gray"),
+            [notion_table(["Input Keyword", "Category", "ORE Framework Class / Ref", "Resolved"], table_rows)],
+        )
+    )
+    return blocks
+
+
+def _build_model_calculator_picker_blocks(analysis: KeywordAnalysisResult) -> List[Dict[str, Any]]:
+    """Render interactive ORE Model & Calculator recommendations driven by detected keywords."""
+    blocks: List[Dict[str, Any]] = [
+        heading(3, "🧠 Recommended ORE Models (check to run)"),
+    ]
+    for m in analysis.recommended_models:
+        badge = " ★ detected" if m.matched_explicitly else ""
+        blocks.append(
+            todo(
+                rt(f"[model:{m.id}] ", bold=True, code=True, color="purple")
+                + rt(f"{m.name}{badge} — ", bold=True)
+                + rt(f"{m.ore_class} · {m.reason}", color="gray"),
+                checked=m.selected,
+            )
+        )
+
+    blocks.append(heading(3, "🧮 Recommended ORE Calculators & Engines (check to switch)"))
+    for c in analysis.recommended_calculators:
+        blocks.append(
+            todo(
+                rt(f"[calc:{c.id}] ", bold=True, code=True, color="green")
+                + rt(f"{c.name} — ", bold=True)
+                + rt(f"{c.outputs} ({c.ore_engine}) · {c.reason}", color="gray"),
+                checked=c.selected,
+            )
+        )
+    return blocks
 
 
 def _build_scope_rail_blocks(scope: ScopeSpec) -> List[Dict[str, Any]]:
@@ -232,6 +333,13 @@ def build_recipe_page_blocks(compiled: CompiledRecipe) -> List[Dict[str, Any]]:
         )
     )
     left_blocks.append(divider())
+
+    if compiled.keyword_analysis is not None:
+        left_blocks.extend(_build_separated_keywords_blocks(compiled.keyword_analysis))
+        left_blocks.append(divider())
+        left_blocks.extend(_build_model_calculator_picker_blocks(compiled.keyword_analysis))
+        left_blocks.append(divider())
+
     left_blocks.append(heading(3, "📊 Compiled Annotations & ORE Results"))
 
     for ann in compiled.annotations:
